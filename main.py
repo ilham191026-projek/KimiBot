@@ -1,6 +1,6 @@
 """
-Entry point and scheduler for the SMC Bot.
-Runs the 60-second scan loop during London and NY sessions.
+SMC/ICT/CRT/MSNR Bot v3.0
+Main Entry Point — Telegram Bot Handler
 """
 
 import asyncio
@@ -13,14 +13,19 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from telegram.ext import Application
+from telegram import Update, Bot
+from dotenv import load_dotenv
+
+# Load env vars
+load_dotenv()
 
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    SCAN_INTERVAL_SECONDS,
     DEFAULT_PAIRS,
     DEFAULT_CAPITAL,
     DEFAULT_RISK_PCT,
+    SCAN_INTERVAL_SECONDS,
 )
 from utils.logger import get_logger
 from utils.time_utils import is_active_session, get_current_session, format_gmt, now_gmt
@@ -36,301 +41,285 @@ from signals.signal_formatter import format_signal_html
 from filters.volatility_gate import check_volatility_gate
 from filters.cooldown import CooldownManager
 from filters.spread_check import check_spread
+from bot import (
+    cmd_start,
+    cmd_status,
+    cmd_signal,
+    cmd_risk,
+    cmd_pairs,
+    cmd_news,
+    cmd_setpairs,
+    error_handler,
+    load_settings,
+    save_settings,
+    user_settings,
+    active_pairs,
+    last_scan_time,
+)
 
 logger = get_logger(__name__)
 
-# ── Global State ─────────────────────────────────────────────────────────────
+# ── Global State ──────────────────────────────────────────────────────────────
 data_fetcher = DataFetcher()
 signal_builder = SignalBuilder()
 cooldown_manager = CooldownManager()
-active_pairs = list(DEFAULT_PAIRS)
-last_scan_time: Optional[str] = None
+scan_counter = 0
 running = True
 
-USER_SETTINGS_FILE = "user_settings.json"
 
-
-def load_user_settings() -> None:
-    """Load user settings from disk."""
-    global active_pairs
-    
-    if os.path.exists(USER_SETTINGS_FILE):
-        try:
-            with open(USER_SETTINGS_FILE, "r") as f:
-                data = json.load(f)
-                
-                # Load active pairs from default chat
-                default_settings = data.get("0", {})
-                saved_pairs = default_settings.get("active_pairs")
-                if saved_pairs:
-                    active_pairs = saved_pairs
-                    
-                logger.info("Loaded settings: %d entries", len(data))
-        except Exception as e:
-            logger.error("Error loading user settings: %s", e)
-
-
-def save_user_settings() -> None:
-    """Save user settings to disk."""
-    try:
-        existing = {}
-        if os.path.exists(USER_SETTINGS_FILE):
-            with open(USER_SETTINGS_FILE, "r") as f:
-                existing = json.load(f)
-        
-        existing["0"] = {"active_pairs": active_pairs}
-        
-        with open(USER_SETTINGS_FILE, "w") as f:
-            json.dump(existing, f, indent=2)
-    except Exception as e:
-        logger.error("Error saving settings: %s", e)
-
-
-async def run_scan_for_pair(pair: str, chat_id: int = 0) -> Optional[Dict]:
+async def run_scan_for_pair(
+    pair: str, user_capital: float, user_risk_pct: float, bot: Bot
+) -> Optional[dict]:
     """
-    Run full 6-layer analysis on a single pair.
-    
-    Args:
-        pair: Instrument symbol
-        chat_id: Telegram chat ID for user-specific settings
-        
-    Returns:
-        Signal dict or None if no signal
+    Scan a single pair across all timeframes and generate signal if valid.
     """
-    logger.info("Scanning %s...", pair)
-    
     try:
-        # Step 1: Fetch H1 data for volatility gate
-        h1_df = data_fetcher.get_ohlcv(pair, "H1", limit=50)
+        logger.info(f"Scanning {pair}...")
         
-        # Step 2: Check volatility gate
-        vol_check = check_volatility_gate(pair, h1_df)
-        if not vol_check["passed"]:
-            logger.info("Volatility gate failed for %s", pair)
+        # Fetch data
+        h4_df = await data_fetcher.fetch_async(pair, "H4")
+        h1_df = await data_fetcher.fetch_async(pair, "H1")
+        m30_df = await data_fetcher.fetch_async(pair, "M30")
+        m15_df = await data_fetcher.fetch_async(pair, "M15")
+        m5_df = await data_fetcher.fetch_async(pair, "M5")
+        m1_df = await data_fetcher.fetch_async(pair, "M1")
+        
+        if any(df is None or len(df) < 5 for df in [h4_df, h1_df, m30_df, m15_df, m5_df, m1_df]):
+            logger.warning(f"{pair}: Insufficient data")
             return None
         
-        # Step 3: Fetch all timeframe data
-        dataframes = {}
-        
-        for tf in ["H4", "H1", "M30", "M15", "M5", "M1"]:
-            try:
-                df = data_fetcher.get_ohlcv(pair, tf, limit=100)
-                dataframes[tf] = df
-            except DataUnavailableError:
-                logger.warning("No %s data for %s", tf, pair)
-                dataframes[tf] = None
-        
-        # Step 4: Check spread at M5/M1
-        m5_df = dataframes.get("M5")
-        if m5_df is not None:
-            spread_check = check_spread(pair, m5_df)
-            if not spread_check["passed"]:
-                logger.info("Spread too high for %s", pair)
-                return None
-        
-        # Step 5: Run 6-layer confluence analysis
-        confluence = run_full_analysis(pair, dataframes)
-        
-        if not confluence.get("confluence_passed"):
-            logger.info("Confluence failed for %s: %d/6",
-                       pair, confluence.get("confluence_score", 0))
-            return None
-        
-        # Step 6: Fetch news events
-        news_events = fetch_high_impact_events(hours_ahead=4)
-        
-        # Step 7: Build signal with narrative
-        signal = await signal_builder.build_with_narrative(
-            pair=pair,
-            confluence_results=confluence,
-            dataframes=dataframes,
-            news_events=news_events,
-            chat_id=chat_id,
+        # Run confluence analysis
+        confluence = run_full_analysis(
+            pair, h4_df, h1_df, m30_df, m15_df, m5_df, m1_df
         )
         
-        if signal:
-            logger.info("Signal generated for %s!", pair)
+        if not confluence.get("signal_valid"):
+            logger.info(f"{pair}: No valid confluence")
+            return None
         
-        return signal
+        # Check volatility
+        if not check_volatility_gate(pair, h1_df):
+            logger.info(f"{pair}: Volatility gate failed")
+            return None
         
-    except DataUnavailableError as e:
-        logger.warning("Data unavailable for %s: %s", pair, e)
-        return None
+        # Check spread
+        if not check_spread(pair):
+            logger.info(f"{pair}: Spread too wide")
+            return None
+        
+        # Check cooldown
+        if cooldown_manager.is_in_cooldown(pair):
+            logger.info(f"{pair}: In cooldown")
+            return None
+        
+        # Build signal
+        signal_data = signal_builder.build(
+            pair=pair,
+            confluence=confluence,
+            m15_df=m15_df,
+            m5_df=m5_df,
+            m1_df=m1_df,
+            capital=user_capital,
+            risk_pct=user_risk_pct,
+        )
+        
+        if not signal_data or not signal_data.get("valid"):
+            logger.warning(f"{pair}: Signal validation failed")
+            return None
+        
+        # Generate narrative
+        narrative = await generate_narrative(signal_data, confluence)
+        signal_data["narrative"] = narrative
+        
+        # Mark cooldown
+        cooldown_manager.mark_signal(pair)
+        
+        logger.info(f"✅ {pair} {signal_data['direction']} signal generated")
+        
+        return signal_data
+        
     except Exception as e:
-        logger.error("Error scanning %s: %s", pair, e)
+        logger.error(f"Error scanning {pair}: {e}", exc_info=True)
         return None
 
 
-async def run_scheduled_scan(bot) -> None:
-    """Run the scheduled scan loop."""
-    global last_scan_time
+async def scan_job(pairs: List[str], user_capital: float, user_risk_pct: float, bot: Bot):
+    """
+    Main scan job — scan all pairs concurrently.
+    """
+    global scan_counter
+    scan_counter += 1
     
-    logger.info("Starting scheduled scan loop")
-    logger.info("Session check: %s", get_current_session())
+    now = now_gmt()
+    session = get_current_session()
+    is_active = is_active_session()
+    
+    logger.info(f"\n{'='*70}")
+    logger.info(f"[SCAN #{scan_counter}] {now} GMT | Session: {session} | Active: {is_active}")
+    logger.info(f"Pairs: {', '.join(pairs)}")
+    logger.info(f"Capital: ${user_capital:.2f}, Risk: {user_risk_pct}%")
+    logger.info(f"{'='*70}\n")
+    
+    # Run scans concurrently
+    tasks = [
+        run_scan_for_pair(pair, user_capital, user_risk_pct, bot)
+        for pair in pairs
+    ]
+    signals = await asyncio.gather(*tasks)
+    
+    # Send signals to Telegram
+    for signal in signals:
+        if signal:
+            try:
+                html = format_signal_html(signal)
+                if len(html) > 4000:
+                    html = html[:4000] + "\n\n<i>(truncated)</i>"
+                
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=html,
+                    parse_mode="HTML",
+                )
+                logger.info(f"Signal sent to chat {TELEGRAM_CHAT_ID}")
+            except Exception as e:
+                logger.error(f"Error sending signal: {e}")
+    
+    # Clear cache
+    clear_cache()
+
+
+async def scheduled_scan(bot: Bot, pairs: List[str], capital: float, risk_pct: float):
+    """
+    Wrapper for scheduled scans.
+    """
+    try:
+        await scan_job(pairs, capital, risk_pct, bot)
+    except Exception as e:
+        logger.error(f"Scan job error: {e}", exc_info=True)
+
+
+async def scheduler_loop(app: Application):
+    """
+    Simple async scheduler loop.
+    """
+    global running
+    
+    # Load user settings
+    load_settings()
+    
+    # Get initial settings
+    capital = float(os.getenv("DEFAULT_CAPITAL", DEFAULT_CAPITAL))
+    risk_pct = float(os.getenv("DEFAULT_RISK_PCT", DEFAULT_RISK_PCT))
+    pairs = list(DEFAULT_PAIRS)
+    scan_interval = SCAN_INTERVAL_SECONDS
+    
+    bot = app.bot
+    last_scan = datetime.now()
+    
+    logger.info("Scheduler started")
     
     while running:
         try:
-            # Check if we're in an active session
-            if not is_active_session():
-                session = get_current_session()
-                next_session_min = 0
+            now = datetime.now()
+            
+            # Check if it's time to scan
+            if (now - last_scan).total_seconds() >= scan_interval:
+                # Get latest settings
+                if TELEGRAM_CHAT_ID in user_settings:
+                    settings = user_settings[TELEGRAM_CHAT_ID]
+                    capital = float(settings.get("capital", capital))
+                    risk_pct = float(settings.get("risk_pct", risk_pct))
+                    pairs = settings.get("pairs", pairs)
                 
-                # Calculate time until next session
-                from utils.time_utils import time_until_next_session
-                wait_min = time_until_next_session()
-                wait_sec = min(wait_min * 60, 300)  # Check every 5 min max
-                
-                logger.info(
-                    "Off-hours (%s). Waiting %d minutes until next session...",
-                    session, wait_sec // 60
-                )
-                await asyncio.sleep(wait_sec)
-                continue
+                # Run scan
+                await scheduled_scan(bot, pairs, capital, risk_pct)
+                last_scan = now
             
-            # We're in an active session — scan all pairs
-            logger.info("=" * 50)
-            logger.info("Starting scan cycle — Session: %s", get_current_session())
-            logger.info("=" * 50)
-            
-            signals_found = 0
-            
-            for pair in active_pairs:
-                if not running:
-                    break
-                
-                # Skip pairs on cooldown
-                if cooldown_manager.is_on_cooldown(pair):
-                    remaining = cooldown_manager.time_remaining(pair)
-                    logger.info("%s on cooldown (%.0f min remaining)", pair, remaining / 60)
-                    continue
-                
-                try:
-                    signal = await run_scan_for_pair(pair)
-                    
-                    if signal:
-                        signals_found += 1
-                        last_scan_time = format_gmt(now_gmt())
-                        
-                        # Send signal to Telegram
-                        if TELEGRAM_CHAT_ID:
-                            try:
-                                chat_id = int(TELEGRAM_CHAT_ID)
-                                await send_signal_to_chat(bot, chat_id, signal)
-                                cooldown_manager.trigger(pair)
-                            except Exception as e:
-                                logger.error("Error sending signal: %s", e)
-                        
-                        # Small delay between signals
-                        await asyncio.sleep(2)
-                        
-                except Exception as e:
-                    logger.error("Error in scan cycle for %s: %s", pair, e)
-                    continue
-            
-            last_scan_time = format_gmt(now_gmt())
-            
-            logger.info(
-                "Scan cycle complete. Signals found: %d. Next scan in %ds",
-                signals_found, SCAN_INTERVAL_SECONDS
-            )
-            
-            # Wait for next scan interval
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-            
-        except Exception as e:
-            logger.error("Error in scheduled scan loop: %s", e)
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
-
-async def main() -> None:
-    """Main entry point — starts bot and scheduler."""
-    logger.info("=" * 60)
-    logger.info("SMC/ICT/CRT/MSNR Bot v3.0 Starting...")
-    logger.info("=" * 60)
-    
-    # Load settings
-    load_user_settings()
-    
-    # Create Telegram bot application
-    application = create_application()
-    
-    if application is None:
-        logger.error("Failed to create bot application. Exiting.")
-        return
-    
-    # Initialize bot
-    await application.initialize()
-    await application.start()
-    
-    bot = application.bot
-    
-    # Send startup message
-    if TELEGRAM_CHAT_ID:
-        try:
-            await bot.send_message(
-                chat_id=int(TELEGRAM_CHAT_ID),
-                text=(
-                    "🤖 <b>SMC/ICT/CRT/MSNR Bot v3.0</b> is now running!\n\n"
-                    f"Session: {get_current_session()}\n"
-                    f"Pairs: {len(active_pairs)}\n"
-                    f"Scan interval: {SCAN_INTERVAL_SECONDS}s\n\n"
-                    "Use /status for details."
-                ),
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.error("Failed to send startup message: %s", e)
-    
-    # Start polling for commands
-    await application.updater.start_polling(drop_pending_updates=True)
-    
-    logger.info("Bot polling started")
-    
-    # Run scheduled scan loop in background
-    scan_task = asyncio.create_task(run_scheduled_scan(bot))
-    
-    logger.info("Scheduler started. Bot is running.")
-    
-    try:
-        # Keep running until interrupted
-        while running:
+            # Sleep briefly to avoid busy-waiting
             await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        logger.info("Main task cancelled")
-    finally:
-        # Cleanup
-        logger.info("Shutting down...")
-        scan_task.cancel()
+            
+        except Exception as e:
+            logger.error(f"Scheduler error: {e}", exc_info=True)
+            await asyncio.sleep(5)
+
+
+async def main_async(app: Application):
+    """
+    Main async entry point.
+    """
+    # Start the bot
+    async with app:
+        # Run scheduler in background
+        scheduler_task = asyncio.create_task(scheduler_loop(app))
+        
+        # Start polling
+        await app.start()
+        await app.updater.start_polling()
+        
         try:
-            await scan_task
-        except asyncio.CancelledError:
-            pass
-        
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        
-        logger.info("Bot stopped. Goodbye!")
+            # Keep running
+            await asyncio.Event().wait()
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested")
+        finally:
+            await app.stop()
+            scheduler_task.cancel()
 
 
-def signal_handler(sig, frame) -> None:
-    """Handle shutdown signals gracefully."""
-    global running
-    logger.info("Shutdown signal received (%s)", sig)
-    running = False
+def create_app() -> Optional[Application]:
+    """
+    Create and configure the bot application.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not configured")
+        return None
+    
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        filters,
+    )
+    
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("signal", cmd_signal))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("pairs", cmd_pairs))
+    app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("setpairs", cmd_setpairs))
+    app.add_error_handler(error_handler)
+    
+    return app
+
+
+def main():
+    """
+    Entry point.
+    """
+    logger.info("="*70)
+    logger.info("SMC/ICT/CRT/MSNR Bot v3.0 Starting")
+    logger.info("="*70)
+    
+    # Create app
+    app = create_app()
+    if not app:
+        logger.error("Failed to create application")
+        sys.exit(1)
+    
+    # Run
+    try:
+        asyncio.run(main_async(app))
+    except KeyboardInterrupt:
+        logger.info("Shutdown")
+        sys.exit(0)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run main
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-        sys.exit(0)
-    except Exception as e:
-        logger.error("Fatal error: %s", e)
-        sys.exit(1)
+    main()
