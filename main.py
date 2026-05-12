@@ -36,7 +36,6 @@ from signals.signal_formatter import format_signal_html
 from filters.volatility_gate import check_volatility_gate
 from filters.cooldown import CooldownManager
 from filters.spread_check import check_spread
-from bot import create_application, send_signal_to_chat, active_pairs, last_scan_time
 
 logger = get_logger(__name__)
 
