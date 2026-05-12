@@ -28,7 +28,6 @@ from data.fetcher import DataFetcher, DataUnavailableError
 from data.calendar import fetch_high_impact_events
 from data.cache import clear as clear_cache
 from analysis.confluence import run_full_analysis
-from analysis.layer4_m15_crt import find_m15_swing, find_m30_swing
 from risk.sl_tp_calculator import calculate_sl_tp
 from risk.lot_sizer import calculate_lot_size
 from ai.signal_narrator import generate_narrative
